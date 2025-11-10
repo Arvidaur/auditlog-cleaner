@@ -1,0 +1,11 @@
+# Go build
+main
+*.exe
+*.out
+
+# Docker
+pgdata/
+*.log
+
+# VSCode
+.vscode/
