@@ -1,0 +1,17 @@
+# Start from official Go build image
+FROM golang:1.23
+
+WORKDIR /app
+
+# Copy go module files and install dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN go build -o main .
+
+# Run the program
+CMD ["./main"]
