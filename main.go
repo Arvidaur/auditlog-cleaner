@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -37,15 +38,14 @@ func main() {
 		log.Fatal("Invalid port number")
 	}
 
-	// Convert timing values to int with defaults
-	insertInterval, err := strconv.Atoi(insertIntervalStr)
+	insertInterval, err := strconv.ParseFloat(insertIntervalStr, 64)
 	if err != nil || insertInterval <= 0 {
-		insertInterval = 5 // Default: 5 seconds
+		insertInterval = 5.0 // Default: 5 seconds
 	}
 
-	cleanupInterval, err := strconv.Atoi(cleanupIntervalStr)
+	cleanupInterval, err := strconv.ParseFloat(cleanupIntervalStr, 64)
 	if err != nil || cleanupInterval <= 0 {
-		cleanupInterval = 60 // Default: 60 seconds
+		cleanupInterval = 60.0 // Default: 60 seconds
 	}
 
 	maxLogAge, err := strconv.Atoi(maxLogAgeStr)
@@ -54,8 +54,8 @@ func main() {
 	}
 
 	fmt.Printf("Configuration:\n")
-	fmt.Printf("  Insert interval: %d seconds\n", insertInterval)
-	fmt.Printf("  Cleanup interval: %d seconds\n", cleanupInterval)
+	fmt.Printf("  Insert interval: %.1f seconds\n", insertInterval)
+	fmt.Printf("  Cleanup interval: %.1f seconds\n", cleanupInterval)
 	fmt.Printf("  Max log age: %d seconds\n\n", maxLogAge)
 
 	psqlInfo := fmt.Sprintf(
@@ -138,32 +138,57 @@ func deleteOldRecords(db *sql.DB, secondsOld int) {
 				ORDER BY created_at ASC 
 				LIMIT $2
 			)
+			RETURNING id, message, created_at
 		`
 
-		result, err := db.Exec(query, cutoffTime, batchSize)
+		rows, err := db.Query(query, cutoffTime, batchSize)
 		if err != nil {
 			log.Printf("Error deleting: %v", err)
 			return
 		}
 
-		rowsAffected, _ := result.RowsAffected()
-		if rowsAffected == 0 {
+		var deletedIDs []int
+		var deletedCount int
+
+		for rows.Next() {
+			var id int
+			var message string
+			var createdAt time.Time
+
+			err := rows.Scan(&id, &message, &createdAt)
+			if err != nil {
+				log.Printf("Error scanning: %v", err)
+				continue
+			}
+
+			deletedIDs = append(deletedIDs, id)
+			deletedCount++
+			fmt.Printf("    - ID=%d, Message=%s, Created=%v\n", id, message, createdAt.Format("15:04:05"))
+		}
+		rows.Close()
+
+		if deletedCount == 0 {
 			break // No more records to delete
 		}
 
-		totalDeleted += int(rowsAffected)
-		fmt.Printf("  Deleted batch of %d records...\n", rowsAffected)
+		totalDeleted += deletedCount
+		fmt.Printf("  Deleted batch of %d records (IDs: %v)\n", deletedCount, deletedIDs)
 
 		// Small pause between batches to avoid overwhelming the database
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
+
 	}
 
-	fmt.Printf("Deleted %d total records older than %d seconds\n", totalDeleted, secondsOld)
+	if totalDeleted > 0 {
+		fmt.Printf("✓ Deleted %d total records older than %d seconds\n", totalDeleted, secondsOld)
+	} else {
+		fmt.Printf("✓ No records older than %d seconds to delete\n", secondsOld)
+	}
 }
 
-func insertAuditLogsRoutine(db *sql.DB, intervalSeconds int) {
+func insertAuditLogsRoutine(db *sql.DB, intervalSeconds float64) {
 	counter := 1
-	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+	ticker := time.NewTicker(time.Duration(intervalSeconds*1000) * time.Millisecond)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -173,12 +198,28 @@ func insertAuditLogsRoutine(db *sql.DB, intervalSeconds int) {
 	}
 }
 
-func cleanupOldRecordsRoutine(db *sql.DB, intervalSeconds int, maxAgeSeconds int) {
-	ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+func cleanupOldRecordsRoutine(db *sql.DB, intervalSeconds float64, maxAgeSeconds int) {
+	ticker := time.NewTicker(time.Duration(intervalSeconds*1000) * time.Millisecond)
 	defer ticker.Stop()
 
+	var mu sync.Mutex
+	isRunning := false
+
 	for range ticker.C {
+		mu.Lock()
+		if isRunning {
+			fmt.Println("⚠️  Previous cleanup still running, skipping this cycle")
+			mu.Unlock()
+			continue
+		}
+		isRunning = true
+		mu.Unlock()
+
 		fmt.Println("\n--- Running cleanup job ---")
 		deleteOldRecords(db, maxAgeSeconds)
+
+		mu.Lock()
+		isRunning = false
+		mu.Unlock()
 	}
 }
