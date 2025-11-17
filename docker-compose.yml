@@ -1,26 +1,15 @@
 version: '3.8'
 
 services: 
-  db:
-    image: postgres:13
-    container_name: auditlog_db
-    restart: always
-    environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: auditlogs
-    ports:
-      - "5432:5432"
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-
   app:
     build: .
-    container_name: auditlog_app
-    depends_on:
-      - db
+    container_name: auditlog_cleaner
     restart: always
-    
-    
-volumes:
-  pg_data:
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      CLEANUP_INTERVAL_SECONDS: ${CLEANUP_INTERVAL_SECONDS}
+      MAX_LOG_AGE_SECONDS: ${MAX_LOG_AGE_SECONDS}

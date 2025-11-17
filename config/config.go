@@ -24,21 +24,14 @@ type DatabaseConfig struct {
 }
 
 type TimingConfig struct {
-	InsertIntervalSeconds  float64
 	CleanupIntervalSeconds float64
 	MaxLogAgeSeconds       int
-	InsertAmountOfLogs     int
 }
 
 // Load reads configuration from .env file and environment variables
 func Load() (*Config, error) {
 	// Load .env file (optional - environment variables take precedence)
 	_ = godotenv.Load()
-
-	insertInterval, err := getEnvAsFloat("INSERT_INTERVAL_SECONDS")
-	if err != nil {
-		return nil, fmt.Errorf("invalid INSERT_INTERVAL_SECONDS: %v", err)
-	}
 
 	cleanupInterval, err := getEnvAsFloat("CLEANUP_INTERVAL_SECONDS")
 	if err != nil {
@@ -48,11 +41,6 @@ func Load() (*Config, error) {
 	maxLogAge, err := getEnvAsInt("MAX_LOG_AGE_SECONDS")
 	if err != nil {
 		return nil, fmt.Errorf("invalid MAX_LOG_AGE_SECONDS: %v", err)
-	}
-
-	InsertAmount, err := getEnvAsInt("INSERT_AMOUNT_OF_LOGS")
-	if err != nil {
-		return nil, fmt.Errorf("invalid INSERT_AMOUNT_OF_LOGS: %v", err)
 	}
 
 	port, err := getEnvAsInt("POSTGRES_PORT")
@@ -70,8 +58,6 @@ func Load() (*Config, error) {
 			SSLMode:  getEnv("POSTGRES_SSL_MODE", "disable"),
 		},
 		Timing: TimingConfig{
-			InsertIntervalSeconds:  insertInterval,
-			InsertAmountOfLogs:     InsertAmount,
 			CleanupIntervalSeconds: cleanupInterval,
 			MaxLogAgeSeconds:       maxLogAge,
 		},
@@ -92,8 +78,6 @@ func (c *DatabaseConfig) ConnectionString() string {
 func (c *Config) Print() {
 	fmt.Printf("Configuration:\n")
 	fmt.Printf("  Database: %s@%s:%d/%s\n", c.Database.User, c.Database.Host, c.Database.Port, c.Database.DBName)
-	fmt.Printf("  Insert interval: %.1f seconds\n", c.Timing.InsertIntervalSeconds)
-	fmt.Printf("  Insert amount: %d logs per batch\n", c.Timing.InsertAmountOfLogs)
 	fmt.Printf("  Cleanup interval: %.1f seconds\n", c.Timing.CleanupIntervalSeconds)
 	fmt.Printf("  Max log age: %d seconds\n\n", c.Timing.MaxLogAgeSeconds)
 }

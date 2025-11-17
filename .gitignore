@@ -2,6 +2,7 @@
 main
 *.exe
 *.out
+.env
 
 # Docker
 pgdata/
