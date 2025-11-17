@@ -1,205 +1,188 @@
 package main
 
 import (
+	"auditlog-cleaner/config"
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
-	"strconv"
+	"math/rand"
 	"sync"
 	"time"
 
-	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
+var methods = []string{"POST", "GET", "DELETE", "PUT", "PATCH"}
+
+// ---------------------------------------------------------
+// MAIN
+// ---------------------------------------------------------
 func main() {
-	// Load .env file
-	err := godotenv.Load()
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		log.Fatal("Error loading configuration:", err)
 	}
 
-	// Read environment variables directly
-	host := os.Getenv("POSTGRES_HOST")
-	portStr := os.Getenv("POSTGRES_PORT")
-	user := os.Getenv("POSTGRES_USER")
-	password := os.Getenv("POSTGRES_PASSWORD")
-	dbname := os.Getenv("POSTGRES_DB")
+	cfg.Print()
 
-	// Read timing configuration
-	insertIntervalStr := os.Getenv("INSERT_INTERVAL_SECONDS")
-	cleanupIntervalStr := os.Getenv("CLEANUP_INTERVAL_SECONDS")
-	maxLogAgeStr := os.Getenv("MAX_LOG_AGE_SECONDS")
-
-	// Convert port to int
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		log.Fatal("Invalid port number")
-	}
-
-	insertInterval, err := strconv.ParseFloat(insertIntervalStr, 64)
-	if err != nil || insertInterval <= 0 {
-		insertInterval = 5.0 // Default: 5 seconds
-	}
-
-	cleanupInterval, err := strconv.ParseFloat(cleanupIntervalStr, 64)
-	if err != nil || cleanupInterval <= 0 {
-		cleanupInterval = 60.0 // Default: 60 seconds
-	}
-
-	maxLogAge, err := strconv.Atoi(maxLogAgeStr)
-	if err != nil || maxLogAge <= 0 {
-		maxLogAge = 30 // Default: 30 seconds
-	}
-
-	fmt.Printf("Configuration:\n")
-	fmt.Printf("  Insert interval: %.1f seconds\n", insertInterval)
-	fmt.Printf("  Cleanup interval: %.1f seconds\n", cleanupInterval)
-	fmt.Printf("  Max log age: %d seconds\n\n", maxLogAge)
-
-	psqlInfo := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-		host, port, user, password, dbname,
-	)
-
-	fmt.Println("Connection string:", psqlInfo)
-
-	db, err := sql.Open("postgres", psqlInfo)
+	db, err := sql.Open("postgres", cfg.Database.ConnectionString())
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	// Test connection
-	err = db.Ping()
-	if err != nil {
+	if err := db.Ping(); err != nil {
 		log.Fatal("Cannot connect to database:", err)
 	}
-	fmt.Println("Successfully connected to database!")
+	fmt.Println("✓ Connected to database")
 
-	// Create table if it doesn't exist
-	createTableQuery := `
-		CREATE TABLE IF NOT EXISTS audit_logs (
-			id SERIAL PRIMARY KEY,
-			message TEXT NOT NULL,
-			created_at TIMESTAMP NOT NULL DEFAULT NOW()
-		);
-		CREATE INDEX IF NOT EXISTS idx_created_at ON audit_logs(created_at);
+	// Reset return error
+	resetTable(db)
+
+	// Create root table
+	createRootTable(db)
+
+	// Start goroutines
+	go insertAuditLogsRoutine(db, cfg.Timing.InsertIntervalSeconds, cfg.Timing.InsertAmountOfLogs)
+	go cleanupRoutine(db, cfg.Timing.CleanupIntervalSeconds, cfg.Timing.MaxLogAgeSeconds)
+
+	fmt.Println("Audit log cleaner started. CTRL+C to stop.")
+	select {}
+}
+
+// ---------------------------------------------------------
+// DB SETUP
+// ---------------------------------------------------------
+func resetTable(db *sql.DB) {
+	_, err := db.Exec(`DROP TABLE IF EXISTS audit_logs CASCADE;`)
+	if err != nil {
+		log.Fatal("Drop error:", err)
+	}
+	fmt.Println("✓ Dropped old audit_logs table")
+}
+
+func createRootTable(db *sql.DB) {
+	query := `
+		CREATE TABLE audit_logs (
+			id BIGSERIAL,
+			method TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (id, created_at)
+		) PARTITION BY RANGE (created_at);
 	`
 
-	_, err = db.Exec(createTableQuery)
+	_, err := db.Exec(query)
 	if err != nil {
-		log.Fatal("Failed to create table:", err)
+		log.Fatal("Failed creating parent table:", err)
 	}
-	fmt.Println("Table ready!")
-
-	// Start goroutine to insert audit logs every 5 seconds
-	go insertAuditLogsRoutine(db, insertInterval)
-
-	// Start goroutine to delete old records every minute
-	go cleanupOldRecordsRoutine(db, cleanupInterval, maxLogAge)
-
-	// Keep the program running
-	fmt.Println("Audit log system started. Press Ctrl+C to stop.")
-	select {} // Block forever
+	fmt.Println("✓ Created partitioned audit_logs parent table")
 }
 
-func postToDB(db *sql.DB, message string) {
-	query := `
-        INSERT INTO audit_logs (message, created_at)
-        VALUES ($1, $2)
-        RETURNING id, created_at
-    `
+// ---------------------------------------------------------
+// PARTITIONS
+// ---------------------------------------------------------
+func ensurePartition(db *sql.DB, t time.Time) error {
+	start := t.Truncate(time.Minute) // ex: 12:05:00
+	end := start.Add(time.Minute)    // ex: 12:06:00
+	name := fmt.Sprintf("audit_logs_%s", start.Format("20060102_1504"))
 
-	var id int
-	var createdAt time.Time
-	err := db.QueryRow(query, message, time.Now()).Scan(&id, &createdAt)
-	if err != nil {
-		log.Fatalf("Failed to insert audit log: %v", err)
+	stmt := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s
+		PARTITION OF audit_logs
+		FOR VALUES FROM ('%s') TO ('%s');
+	`,
+		name,
+		start.Format("2006-01-02 15:04:05"),
+		end.Format("2006-01-02 15:04:05"))
+
+	_, err := db.Exec(stmt)
+	if err == nil {
+		fmt.Printf("✓ Partition ensured: %s\n", name)
 	}
-
-	fmt.Printf("Inserted: ID=%d, Message=%s, Time=%v\n", id, message, createdAt)
+	return err
 }
 
-func deleteOldRecords(db *sql.DB, secondsOld int) {
-	cutoffTime := time.Now().Add(-time.Duration(secondsOld) * time.Second)
+func dropOldPartitions(db *sql.DB, olderThanSeconds int) {
+	cutoff := time.Now().Add(-time.Duration(olderThanSeconds) * time.Second)
 
-	// Delete in batches of 5 to reduce database load
-	batchSize := 5
-	totalDeleted := 0
+	partitionToDrop := fmt.Sprintf("audit_logs_%s", cutoff.Format("20060102_1504"))
 
-	for {
-		query := `
-			DELETE FROM audit_logs 
-			WHERE id IN (
-				SELECT id FROM audit_logs 
-				WHERE created_at < $1 
-				ORDER BY created_at ASC 
-				LIMIT $2
-			)
-			RETURNING id, message, created_at
-		`
+	stmt := fmt.Sprintf(`DROP TABLE IF EXISTS %s CASCADE;`, partitionToDrop)
 
-		rows, err := db.Query(query, cutoffTime, batchSize)
-		if err != nil {
-			log.Printf("Error deleting: %v", err)
-			return
-		}
-
-		var deletedIDs []int
-		var deletedCount int
-
-		for rows.Next() {
-			var id int
-			var message string
-			var createdAt time.Time
-
-			err := rows.Scan(&id, &message, &createdAt)
-			if err != nil {
-				log.Printf("Error scanning: %v", err)
-				continue
-			}
-
-			deletedIDs = append(deletedIDs, id)
-			deletedCount++
-			fmt.Printf("    - ID=%d, Message=%s, Created=%v\n", id, message, createdAt.Format("15:04:05"))
-		}
-		rows.Close()
-
-		if deletedCount == 0 {
-			break // No more records to delete
-		}
-
-		totalDeleted += deletedCount
-		fmt.Printf("  Deleted batch of %d records (IDs: %v)\n", deletedCount, deletedIDs)
-
-		// Small pause between batches to avoid overwhelming the database
-		time.Sleep(1000 * time.Millisecond)
-
-	}
-
-	if totalDeleted > 0 {
-		fmt.Printf("✓ Deleted %d total records older than %d seconds\n", totalDeleted, secondsOld)
-	} else {
-		fmt.Printf("✓ No records older than %d seconds to delete\n", secondsOld)
+	_, err := db.Exec(stmt)
+	if err == nil {
+		fmt.Printf("✓ Dropped old partition: %s\n", partitionToDrop)
 	}
 }
 
-func insertAuditLogsRoutine(db *sql.DB, intervalSeconds float64) {
-	counter := 1
-	ticker := time.NewTicker(time.Duration(intervalSeconds*1000) * time.Millisecond)
+// ---------------------------------------------------------
+// INSERT ROUTINE
+// ---------------------------------------------------------
+func insertAuditLogsRoutine(db *sql.DB, everySeconds float64, amountOfLogs int) {
+	ticker := time.NewTicker(time.Duration(everySeconds * float64(time.Second)))
 	defer ticker.Stop()
 
 	for range ticker.C {
-		message := fmt.Sprintf("Audit log #%d", counter)
-		postToDB(db, message)
-		counter++
+		if err := writeAuditLogsToDbBatch(db, amountOfLogs); err != nil {
+			fmt.Println("Batch insert failed:", err)
+		} else {
+			fmt.Printf("✓ Inserted %d logs in batch\n", amountOfLogs)
+		}
 	}
 }
 
-func cleanupOldRecordsRoutine(db *sql.DB, intervalSeconds float64, maxAgeSeconds int) {
-	ticker := time.NewTicker(time.Duration(intervalSeconds*1000) * time.Millisecond)
+// func writeAuditLogsToDbBatch add x amount of logs (batch)
+func writeAuditLogsToDbBatch(db *sql.DB, amountOfLogs int) error {
+	now := time.Now()
+
+	// Ensure partition exists BEFORE starting transaction
+	if err := ensurePartition(db, now); err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.Prepare(`INSERT INTO audit_logs (method, created_at) VALUES ($1, $2)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for i := 0; i < amountOfLogs; i++ {
+		method := methods[rand.Intn(len(methods))]
+		_, err := stmt.Exec(method, now)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// func writeAuditLogsToDbPerSecondBatch (uses)
+// Not used
+// func writeAuditLogsToDbPerSecondBatch(db *sql.DB, amountOfLogs int) {
+// 	ticker := time.NewTicker(1 * time.Second)
+// 	defer ticker.Stop()
+
+// 	for range ticker.C {
+// 		if err := writeAuditLogsToDbBatch(db, amountOfLogs); err != nil {
+// 			fmt.Println("Batch insert failed:", err)
+// 		} else {
+// 			fmt.Printf("Inserted %d logs in batch\n", amountOfLogs)
+// 		}
+// 	}
+// }
+
+// ---------------------------------------------------------
+// CLEANUP ROUTINE
+// ---------------------------------------------------------
+func cleanupRoutine(db *sql.DB, everySeconds float64, maxAgeSeconds int) {
+	ticker := time.NewTicker(time.Duration(everySeconds * float64(time.Second)))
 	defer ticker.Stop()
 
 	var mu sync.Mutex
@@ -208,7 +191,7 @@ func cleanupOldRecordsRoutine(db *sql.DB, intervalSeconds float64, maxAgeSeconds
 	for range ticker.C {
 		mu.Lock()
 		if isRunning {
-			fmt.Println("⚠️  Previous cleanup still running, skipping this cycle")
+			fmt.Println("Cleanup already running—skipping")
 			mu.Unlock()
 			continue
 		}
@@ -216,7 +199,8 @@ func cleanupOldRecordsRoutine(db *sql.DB, intervalSeconds float64, maxAgeSeconds
 		mu.Unlock()
 
 		fmt.Println("\n--- Running cleanup job ---")
-		deleteOldRecords(db, maxAgeSeconds)
+
+		dropOldPartitions(db, maxAgeSeconds)
 
 		mu.Lock()
 		isRunning = false
